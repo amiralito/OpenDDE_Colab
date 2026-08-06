@@ -13,8 +13,9 @@ an interactive **MolView** model browser.
 * The checkpoint (~2.6 GB) and runtime common files (~0.6 GB) are fetched once
   (`hf_transfer` → `aria2c` → `curl`) and cached to Drive, so later sessions reuse them.
 * **Please read [Job size & token limits](#job-size--token-limits) before planning a screen** —
-  OpenDDE is considerably more memory-hungry per token than Protenix, and this is the main
-  constraint on Colab.
+  memory scales with N² and is the main constraint on Colab.
+* Tested against **OpenDDE v1.0.3**. The install cell tracks `main` by default and prints the
+  installed version; pin a tag in that cell for a reproducible run.
 
 ## Contents
 
@@ -35,8 +36,8 @@ an interactive **MolView** model browser.
 ## Requirements
 
 - A Colab GPU runtime. Memory scales steeply with token count (see
-  [Job size & token limits](#job-size--token-limits)): a **T4** handles monomers up to ~300 tokens,
-  an **A100 (40 GB)** reaches ~500. Larger assemblies are out of reach on a single Colab GPU.
+  [Job size & token limits](#job-size--token-limits)): a **T4** is fine for monomers and small
+  dimers, an **A100** for mid-size complexes. Large assemblies are out of reach on a single Colab GPU.
 - A Google Drive (optional but strongly recommended — the ~3.2 GB of model files, the MSA cache,
   and all outputs survive a disconnect).
 - Nothing to install locally; the venv, OpenDDE, weights, and the MSA server are handled in the
@@ -48,53 +49,52 @@ The first run on a fresh Drive downloads the model files automatically (once).
 
 ## Job size & token limits
 
-**There is no hard-coded token cap in OpenDDE** — the limit is GPU memory, and it binds early.
-The numbers below are from the project's own single-GPU baseline
-([`docs/foldcp_e2e_baseline.md`](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md),
-A800 80 GB, `opendde_v1`, **BF16**, sample=1, diffusion steps=2, cycle=1, PyTorch triangle kernels):
+**There is no hard-coded token cap in OpenDDE** — the limit is GPU memory, and on Colab it binds
+early. How the tokens are counted is the part you can rely on:
 
-| Tokens (N) | Single-GPU peak |
-| ---: | ---: |
-| 101 | 3.5 GiB |
-| 200 | 6.6 GiB |
-| 299 | 14.2 GiB |
-| 401 | 28.6 GiB |
-| 600 | 43.2 GiB |
-| 799 | 44.1 GiB |
-| 1001 | 66.9 GiB |
-| 1399 | 64.2 GiB |
-| ≥ 2000 | **exceeds single-card capacity** (80 GB) |
+- one token per polymer residue (protein / DNA / RNA);
+- **one token per heavy atom** for ligands, ions, and modified residues.
 
-Upstream omits single-GPU runs at N ≥ 2000 because they no longer fit on one 80 GB card; those
-sizes require the **4-GPU Fold-CP** path, which needs `torchrun` across four GPUs and is therefore
-**not available on Colab**.
+So a 300-residue protein with ATP (31 heavy atoms) is ~331 tokens, and a hexamer of a 250-residue
+NLR is ~1500 tokens.
 
-**What that means per Colab GPU** (leaving headroom):
+**Memory grows with N², so the practical ceiling arrives fast.** Upstream previously published a
+single-GPU memory table, but **withdrew it in v1.0.3**, replacing it with a reproduction guide that
+[explicitly declines to publish capacity numbers](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
+and warns against treating one successful run as a supported capacity limit. This repo follows that
+guidance and does not restate the retracted figures. As rough orientation only: in that withdrawn
+baseline (BF16, `sample=1`, `step=2`, `cycle=1`, PyTorch kernels) a ~300-token input sat in the low
+teens of GiB, ~600 tokens in the low forties, and single-GPU runs at N ≥ 2000 did not fit on an
+80 GB card at all. Treat those as order-of-magnitude, not as limits for your settings.
 
-| Colab GPU | VRAM | Practical ceiling |
-| --- | ---: | --- |
-| T4 | 16 GB | ~300 tokens — monomers, small dimers |
-| L4 | 22.5 GB | ~330 tokens |
-| A100 | 40 GB | ~500 tokens |
-| A100 | 80 GB (rare on Colab) | ~1400 tokens |
+**Measure it for your own inputs**, which is cheap to do: run one job with `samples_per_seed = 1`
+and `steps = 20`, then check the peak with
 
-**How tokens are counted.** One token per polymer residue (protein / DNA / RNA), plus **one token
-per heavy atom** for ligands and modified residues. So a 300-residue protein with ATP (31 heavy
-atoms) is ~331 tokens, and a hexamer of a 250-residue NLR is ~1500 tokens — beyond a single
-Colab GPU.
+```python
+!nvidia-smi --query-gpu=memory.used --format=csv
+```
 
-**Three caveats that move these numbers:**
+while it runs, or read the peak the run reports. Scale from there — memory is dominated by the N²
+trunk, so doubling tokens roughly quadruples it.
 
-- **dtype.** The baseline is BF16; the notebooks default to **fp32**, which needs substantially
-  more memory. Switch `dtype` to `bf16` in *Run settings* for anything above ~300 tokens.
-- **Kernels.** The baseline uses the PyTorch triangle kernels. cuEquivariance (selected by `auto`
-  on supported GPUs) is leaner; on Blackwell it is unavailable and the notebooks fall back to the
-  PyTorch path, so expect the table's numbers there.
-- **Samples and steps** raise the diffusion-stage cost but not the dominant N² trunk term; reducing
-  `samples_per_seed` is the first thing to try when a job is marginal.
+**Three settings move the number a lot:**
 
-If a job OOMs: lower `dtype` to `bf16`, cut `samples_per_seed`, split the complex, or move the
-run to a multi-GPU machine and use Fold-CP.
+- **dtype.** The withdrawn baseline used BF16; these notebooks default to **fp32**, which needs
+  substantially more memory. Switch `dtype` to `bf16` in *Run settings* for anything non-trivial.
+- **Kernels.** cuEquivariance (selected by `auto` where supported) is leaner than the PyTorch
+  triangle path. On Blackwell it is unavailable and the notebooks fall back to PyTorch kernels.
+- **Samples.** `samples_per_seed` raises the diffusion-stage cost; reducing it is the first thing
+  to try when a job is marginal.
+
+**Rough guidance for planning on Colab:** monomers, effector–receptor pairs, and small dimers are
+comfortable; large homo-oligomers and full resistosomes are not, and belong on a multi-GPU machine.
+Beyond a single card, OpenDDE's **Fold-CP** mode splits one job across GPUs — as of v1.0.3 it
+supports an arbitrary `1 x P` topology (any `P > 1`, non-square counts included) rather than only a
+2×2 mesh. It is launched with `torchrun`, so it is **not available on Colab**, but it is the route
+for oversized complexes on your own hardware.
+
+If a job OOMs: switch `dtype` to `bf16`, cut `samples_per_seed`, split the complex, or move it to a
+multi-GPU machine and use Fold-CP.
 
 ---
 
@@ -247,6 +247,12 @@ For older ChimeraX / protein-only complexes, open the `*_pae.json` with `format 
   ChimeraX (≥1.10) and ipSAE; the per-residue `.json` route does not.
 - **ipSAE** runs in Boltz mode (`.npz` + `.cif`), default cutoffs 10/10 (adjustable in the cell).
 - **Interface ipTM** is read from OpenDDE's `chain_pair_iptm_global` matrix.
+- **Ions and OpenDDE version.** Before **v1.0.3**, ion entities were dropped when building MSA and
+  template feature metadata, which shifted asymmetric-chain mappings for ion-containing inputs
+  (fixed in [#18](https://github.com/aurekaresearch/OpenDDE/pull/18)). Since the notebooks enable
+  MSAs by default and expose ions in the input cell and via `--ion`, **rerun any ion-containing job
+  predicted with an earlier version.** The install cell prints the installed version and warns if it
+  predates 1.0.3.
 - **Preview software.** OpenDDE is a recent preview release; CLI flags, JSON fields, and
   checkpoints may change between versions, and predictions are not guaranteed reproducible across
   releases.
@@ -286,7 +292,8 @@ For older ChimeraX / protein-only complexes, open the `*_pae.json` with `format 
 
 ## Citation
 
-*Under Development!*
+*Under development...*
+
 If you use these notebooks in your work, please cite this repository:
 
 <!-- PLACEHOLDER — fill in after creating the Zenodo release -->
